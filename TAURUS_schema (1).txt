@@ -1,0 +1,829 @@
+TAURUS INDUSTRIES
+DATA SCHEMA & TECHNICAL ARCHITECTURE DOCUMENT — VOLUME IV
+================================================================================
+████████████████████████████████████████████████████████████
+PROJECT: █████████ [DESIGNATION PENDING]
+DOCUMENT TYPE: Engineering Specification — Schema & Stack
+DERIVED FROM: Founding research session + architecture interview
+STATUS: Pre-build. Schema locked. Implementation pending.
+████████████████████████████████████████████████████████████
+
+This document is the engineering translation of the conceptual architecture.
+It does not replace the philosophical documents. It implements them.
+
+Read the Master Document first.
+This is what the Master Document looks like in a database.
+
+================================================================================
+SECTION 1 — CONFIRMED STACK
+================================================================================
+
+RUST            — Monitoring daemon core / Tauri UI shell
+PYTHON          — LLM orchestration / research layer / conversation logic
+CELERY + REDIS  — Async task queue / message broker for research layer
+POSTGRESQL      — Structured memory / facts / provenance / timestamps
+PGBOUNCER       — Postgres connection pooling
+CHROMADB        — Vector memory / semantic search / pattern matching
+OLLAMA x6       — Remote round robin inference / routine classification
+CLAUDE API      — Deep research and conversation (via OpenRouter fallback)
+TAURI           — UI shell / alerts / dashboard / conversation interface
+WORLDMONITOR    — Forked as Malkuth data foundation / extended with free APIs
+
+RUNTIME:        Local / WSL2 on Windows 11
+HARDWARE:       Dell Optiplex 7060 / i7-8700 / 20GB RAM / AMD RX 6400
+OPTIMIZATION:   Lean first. Scale later. Every component minimizes footprint.
+
+================================================================================
+SECTION 2 — THREE LAYER ARCHITECTURE
+================================================================================
+
+────────────────────────────────────────────────────────────
+LAYER 1 — MONITORING DAEMON (Rust)
+────────────────────────────────────────────────────────────
+
+Always running. Always watching. Does not care if the user is present.
+
+RESPONSIBILITIES:
+    — Poll all data sources on defined intervals
+    — Parse and normalize incoming data into standard record format
+    — Run lightweight classification via Ollama round robin
+    — Detect anomalies against learned baselines (Welford algorithm)
+    — Detect silences — what didn't arrive that should have
+    — Generate QUERY threads when patterns trigger thresholds
+    — Write all findings to memory store with full provenance
+    — Write checkpoints on defined triggers
+    — Fire alerts when escalation thresholds are crossed
+    — Log all downtime gaps as monitoring gap records
+
+DOES NOT:
+    — Talk to the user
+    — Make conclusions
+    — Run deep LLM reasoning
+    — Attempt crash recovery beyond last checkpoint
+
+DATA SOURCES (WorldMonitor fork + extensions):
+    — 100+ RSS feeds (geopolitics, defense, energy, tech)
+    — GDELT (global event database)
+    — ACLED (armed conflict location and event data)
+    — OpenSky (military / civilian flight ADS-B)
+    — VesselFinder AIS (naval / maritime tracking)
+    — USGS (seismic)
+    — NASA FIRMS (satellite fire detection / VIIRS)
+    — NASA EONET (natural events)
+    — Cloudflare Radar (internet outages / traffic anomalies)
+    — FRED (Federal Reserve economic data)
+    — Polymarket (prediction markets as leading indicators)
+    — Additional free API keys as acquired
+
+CHECKPOINT TRIGGERS:
+    — User-initiated request received
+    — Significant data write to memory (alert threshold crossed)
+    — Defined time interval (TBD — likely 15-30 minutes)
+
+CHECKPOINT DOES NOT TRIGGER ON:
+    — Crash
+    — Unplanned shutdown
+
+ON RESTART:
+    — Load last checkpoint
+    — Resume from that state only
+    — Log gap between last checkpoint and restart as monitoring gap
+    — Do not attempt to reconstruct gap period
+    — Treat gap as potential silence data point
+
+────────────────────────────────────────────────────────────
+LAYER 2 — MEMORY / KNOWLEDGE STORE
+────────────────────────────────────────────────────────────
+
+The substrate. Everything reads from it. Everything writes to it.
+Not a layer the user interacts with directly.
+The long-term memory of the investigator.
+
+TWO COMPONENTS:
+
+POSTGRESQL — structured memory
+    Facts, timestamps, provenance chains, tier assignments,
+    source records, QUERY threads, alert history,
+    checkpoint state, monitoring gap log,
+    entity registry, relationship edges (typed + weighted),
+    silence records, decay tracking
+    Connection pooling via PgBouncer — prevents connection bloat
+
+CHROMADB — vector memory
+    Semantic embeddings of all confirmed facts
+    Pattern library (shapes of past silences and convergences)
+    Enables plain-language semantic search across all memory
+    Relationship proximity mapping between entities
+    Used by research layer and conversation layer for context retrieval
+    Runs with memory-mapped files — does not load full index into RAM
+
+POSTGRES / CHROMADB SYNC — CRITICAL ENGINEERING PROBLEM:
+
+    THE FAILURE MODE:
+    A fact decays in Postgres but its embedding still ranks highly in Chroma.
+    Result: semantically relevant but epistemically weak retrieval.
+    Trust-destroying if undetected.
+
+    SOLUTION — TWO STAGE, SIMPLE FIRST:
+
+    Stage 1 — Confidence-weighted retrieval (implemented immediately):
+        Every ChromaDB retrieval gets confidence-weighted at query time.
+        Semantic score multiplied by current Postgres confidence value.
+        Low-confidence facts cannot rank highly regardless of semantic match.
+
+        final_score = semantic_similarity * confidence_value * (1 - decay_factor)
+
+    Stage 2 — Embedding refresh (implemented when system is stable):
+        Scheduled job monitors confidence values in Postgres.
+        When confidence drops below threshold — embedding metadata updated in Chroma.
+        Chroma metadata filtering excludes low-confidence embeddings by default.
+        Explicitly requested low-confidence retrieval still possible (labeled).
+
+HARDWARE RAM ALLOCATION (20GB total):
+    PostgreSQL          —  2-4GB under load
+    ChromaDB            —  1-2GB (memory-mapped)
+    Rust daemon         —  ~200MB
+    Celery workers x4   —  ~500MB each = 2GB
+    Redis (broker)      —  ~200MB
+    Tauri UI            —  ~300MB
+    Ollama (one model)  —  4-6GB (one loaded at a time — not six local)
+    OS overhead         —  2-3GB
+    ─────────────────────────────────
+    Conservative total  —  ~12-18GB
+    Headroom            —  2-8GB
+
+    DISCIPLINE REQUIRED:
+    One Ollama model loaded at a time — six APIs are remote endpoints, not
+    six local processes. This is non-negotiable for RAM management.
+    If ceiling is hit — ChromaDB moves to cheap persistent VPS first.
+    Everything else stays local.
+
+TIME DECAY:
+    — All information decays uniformly over time
+    — Rate: TBD (to be calibrated during build phase)
+    — Decay does not delete — it reduces confidence value
+    — Reconfirmation by new independent source resets decay clock
+    — Decayed facts remain in memory, labeled as aged
+    — High-tier confirmed facts decay slower (rate multiplier TBD)
+
+────────────────────────────────────────────────────────────
+LAYER 3 — RESEARCH + CONVERSATION (Python)
+────────────────────────────────────────────────────────────
+
+CONCURRENCY MODEL — REQUIRED, NOT OPTIONAL:
+    asyncio + aiohttp for all external calls
+    Nothing blocks. Every LLM call, API hit, and memory write
+    runs concurrently where possible.
+
+    Task queue: Celery + Redis as message broker
+    Each QUERY thread becomes a Celery task
+    Tasks run in parallel up to worker limit
+    Worker count: capped at 4 (RAM constraint before CPU)
+    i7-8700 has 12 threads — worker ceiling is RAM, not CPU
+
+    If Python layer still bottlenecks under load:
+    Rust daemon absorbs lightweight orchestration
+    Python handles only LLM-dependent tasks
+    This is the architectural escape hatch — built in from start
+
+RESEARCH SUBLAYER:
+    Triggered by: monitoring daemon QUERY / user question
+    — Checks memory first — what is already known
+    — If memory insufficient — goes external
+    — Runs recursive investigation loop via async task queue
+    — Generates sub-QUERYs from findings
+    — Hard depth limit per thread (TBD — likely 5-7 recursive levels)
+    — Writes all findings to memory with provenance chain
+    — Escalates to alert if silence persists past threshold
+    — Uses Claude API for complex reasoning
+    — Uses Ollama round robin for routine sub-tasks
+
+QUERY EXPLOSION CONTROLS — ALL THREE REQUIRED:
+    1. DEPTH LIMIT
+       Hard ceiling per thread — 5-7 levels maximum
+       Non-negotiable. Enforced at task spawn.
+
+    2. PRIORITY WEIGHTING
+       Every QUERY gets significance score at spawn time
+       Low significance → fewer worker slots
+       High significance → priority queue access
+       Queue is weighted — not FIFO
+
+    3. KILL CONDITIONS
+       Sub-query generates no new information after N attempts → terminate branch
+       Sub-query duplicates existing open QUERY → merge, do not spawn twin
+       Deduplication check runs before every spawn — most important control
+       Total open threads exceed system limit → new QUERYs queue, do not spawn
+       User can manually kill any thread from Tauri UI
+
+CONVERSATION SUBLAYER:
+    Triggered by: user
+    — Plain language input
+    — Semantic search across memory (ChromaDB)
+    — Routes to research layer if memory insufficient
+    — Returns answer with tier label and provenance
+    — Can discuss, challenge, redirect investigations
+    — Surfaces what daemon found while user was absent
+    — Hard rule: can only assert what exists in memory with a source
+    — Opinion and synthesis labeled explicitly as such
+    — Cannot invent citations under any condition
+
+================================================================================
+SECTION 3 — PRIMARY DATA TYPES
+================================================================================
+
+Four types. All information entering or generated by the system
+is assigned exactly one type at intake. Type can be upgraded or
+downgraded as evidence accumulates. Downgrades are permanent records
+— the system remembers when something was demoted and why.
+
+────────────────────────────────────────────────────
+TYPE 1 — VERIFIED
+────────────────────────────────────────────────────
+Definition:
+    Confirmed by multiple independent sources across
+    different domains with no detectable coordination.
+    Cross-domain confirmation required — same-domain
+    confirmation alone is insufficient.
+
+Yetzirah mapping: 3 Mothers — axiomatic foundation
+Confidence floor: HIGH
+Decay rate: Standard (slowest of the four types)
+
+Upgrade path: CONTESTED → VERIFIED
+    Requires: cross-domain independent confirmation
+    Minimum sources: 3 (TBD — to be calibrated)
+    Coordination check: must pass
+
+────────────────────────────────────────────────────
+TYPE 2 — CONTESTED
+────────────────────────────────────────────────────
+Definition:
+    Real phenomenon with credible sourcing.
+    Disputed interpretation or incomplete evidence.
+    Could resolve either direction.
+
+Yetzirah mapping: 7 Doubles — dual nature, could resolve either way
+Confidence floor: MEDIUM
+Decay rate: Standard
+
+Upgrade path: SPECULATIVE → CONTESTED
+    Requires: credible sourcing, no primary source contradiction
+Downgrade path: CONTESTED → SPECULATIVE
+    Requires: primary source contradiction or source discrediting
+
+────────────────────────────────────────────────────
+TYPE 3 — SPECULATIVE
+────────────────────────────────────────────────────
+Definition:
+    Unverified. Circulating. No archival confirmation.
+    Present in the system because absence of confirmation
+    is not confirmation of absence.
+
+Yetzirah mapping: 12 Simples — in motion, unresolved
+Confidence floor: LOW
+Decay rate: Standard (fastest effective decay due to low floor)
+
+Note: SPECULATIVE items are never surfaced as findings.
+They are held in memory as investigation seeds only.
+
+────────────────────────────────────────────────────
+TYPE 4 — QUERY
+────────────────────────────────────────────────────
+Definition:
+    Internally generated investigation thread.
+    Spawned by the system from its own findings.
+    Not external data. A question the system asks itself.
+
+Yetzirah mapping: The recursive loop — Yesod to Tiphareth
+Confidence floor: N/A — not a fact, a question
+Decay rate: Does not decay — persists until resolved or closed
+
+States:
+    OPEN        — actively being investigated
+    ESCALATED   — silence persisted past threshold / alert fired
+    RESOLVED    — closed with findings (findings carry their own tier)
+    CLOSED      — closed without findings (absence documented)
+
+QUERY threads are never dropped.
+A QUERY closed without findings is itself a finding.
+The persistence of silence under active investigation
+is logged as a SILENCE RECORD (see Section 4).
+
+================================================================================
+SECTION 4 — CORE DATA SCHEMAS
+================================================================================
+
+────────────────────────────────────────────────────
+SCHEMA A — INFORMATION RECORD
+The fundamental unit. Every piece of data entering the system.
+────────────────────────────────────────────────────
+
+information_record {
+
+    -- IDENTITY
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP       NOT NULL
+    ingested_at         TIMESTAMP       NOT NULL        -- when daemon received it
+
+    -- CONTENT
+    raw_content         TEXT            NOT NULL        -- exactly as received
+    normalized_content  TEXT                            -- cleaned, standardized
+    summary             TEXT                            -- LLM-generated summary
+    language            VARCHAR(10)                     -- ISO 639-1
+    translated_content  TEXT                            -- if translation occurred
+
+    -- SOURCE
+    source_id           UUID            FK → source_record
+    source_url          TEXT
+    source_domain       VARCHAR(100)
+    publication_time    TIMESTAMP                       -- when source published it
+    retrieval_method    VARCHAR(50)     -- RSS / API / scrape / manual / internal
+
+    -- CLASSIFICATION
+    data_type           ENUM            -- VERIFIED / CONTESTED / SPECULATIVE / QUERY
+    previous_type       ENUM                            -- if type changed
+    type_changed_at     TIMESTAMP
+    type_change_reason  TEXT
+
+    -- DOMAIN TAGS
+    domains             TEXT[]          -- geopolitical / financial / military /
+                                        -- legal / social / environmental /
+                                        -- technological / spiritual / other
+
+    -- GEOGRAPHIC
+    geo_entities        TEXT[]          -- countries, regions, cities mentioned
+    geo_coordinates     POINT[]         -- if extractable
+    geo_confidence      FLOAT           -- 0.0 to 1.0
+
+    -- ENTITY EXTRACTION
+    entities            JSONB           -- persons, organizations, institutions
+                                        -- {name, type, confidence, role}
+
+    -- CONFIDENCE & DECAY
+    confidence_value    FLOAT           -- 0.0 to 1.0
+    confidence_floor    FLOAT           -- minimum after full decay
+    decay_rate          FLOAT           -- per-day reduction
+    last_confirmed_at   TIMESTAMP       -- last independent reconfirmation
+    confirmation_count  INTEGER         -- number of independent confirmations
+
+    -- PROVENANCE CHAIN
+    source_tier         INTEGER         -- 1 (wire) through 4 (blog/aggregator)
+    propaganda_risk     FLOAT           -- 0.0 to 1.0
+    state_affiliated    BOOLEAN
+    affiliated_state    VARCHAR(100)    -- if state_affiliated = true
+    coordination_flag   BOOLEAN         -- potential coordination detected
+    coordination_notes  TEXT
+
+    -- CROSS-REFERENCES
+    related_records     UUID[]          -- other records this connects to
+    confirms_records    UUID[]          -- records this independently confirms
+    contradicts_records UUID[]          -- records this conflicts with
+    spawned_query       UUID            FK → query_record (if this created a QUERY)
+
+    -- CONTEXT
+    displaced_by        UUID            FK → information_record
+                                        -- if a simultaneous loud story
+                                        -- broke at same time as this silence
+    displacement_notes  TEXT
+
+    -- INTERNAL
+    classified_by       VARCHAR(50)     -- ollama-[model] / claude / keyword / manual
+    classification_confidence FLOAT
+    embedding_id        VARCHAR(100)    FK → ChromaDB vector ID
+    raw_hash            VARCHAR(64)     -- SHA256 of raw_content (dedup)
+}
+
+────────────────────────────────────────────────────
+SCHEMA B — SOURCE RECORD
+Every source the system knows about.
+────────────────────────────────────────────────────
+
+source_record {
+
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP
+
+    -- IDENTITY
+    name                VARCHAR(200)    NOT NULL
+    url                 TEXT
+    feed_url            TEXT            -- RSS or API endpoint
+    source_type         ENUM            -- RSS / API / scrape / manual
+
+    -- TRUST MODEL
+    -- NOTE: All sources start at zero.
+    -- Trust is calculated. Never assigned.
+    -- These fields are computed, not set manually.
+
+    trust_score         FLOAT           -- 0.0 to 1.0 — COMPUTED
+    trust_history       JSONB           -- timestamped trust score changes
+    tier                INTEGER         -- 1 through 4 — COMPUTED from history
+    propaganda_risk     FLOAT           -- 0.0 to 1.0 — COMPUTED
+    state_affiliated    BOOLEAN
+    affiliated_state    VARCHAR(100)
+
+    -- TRACK RECORD
+    total_records       INTEGER
+    verified_count      INTEGER         -- how many outputs reached VERIFIED
+    contested_count     INTEGER
+    speculative_count   INTEGER
+    contradiction_count INTEGER         -- times this source contradicted VERIFIED
+    coordination_flags  INTEGER         -- times coordination detected
+
+    -- OPERATIONAL
+    active              BOOLEAN
+    poll_interval       INTEGER         -- seconds
+    last_polled_at      TIMESTAMP
+    last_successful_at  TIMESTAMP
+    circuit_breaker     BOOLEAN         -- true = cooling down
+    cooldown_until      TIMESTAMP
+    error_count         INTEGER
+    consecutive_errors  INTEGER
+}
+
+────────────────────────────────────────────────────
+SCHEMA C — QUERY RECORD
+Internally generated investigation threads.
+────────────────────────────────────────────────────
+
+query_record {
+
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP       NOT NULL
+
+    -- ORIGIN
+    spawned_by          ENUM            -- DAEMON / USER / RESEARCH_LOOP
+    parent_query_id     UUID            FK → query_record (if sub-query)
+    depth               INTEGER         -- recursion depth (0 = root)
+    max_depth           INTEGER         -- depth limit for this thread
+
+    -- CONTENT
+    question            TEXT            NOT NULL    -- the actual question
+    context             TEXT                        -- why this was generated
+    triggering_record   UUID            FK → information_record
+
+    -- STATE
+    status              ENUM            -- OPEN / ESCALATED / RESOLVED / CLOSED
+    status_changed_at   TIMESTAMP
+    escalated_at        TIMESTAMP
+    escalation_reason   TEXT
+
+    -- INVESTIGATION
+    search_attempts     INTEGER
+    sources_consulted   UUID[]          FK → source_record[]
+    records_generated   UUID[]          FK → information_record[]
+    sub_queries         UUID[]          FK → query_record[]
+    findings_summary    TEXT
+    finding_tier        ENUM            -- tier of findings if resolved
+
+    -- SILENCE TRACKING
+    silence_confirmed   BOOLEAN         -- true if active investigation
+                                        -- returned nothing
+    silence_scope       TEXT            -- which domains/sources checked
+    silence_record_id   UUID            FK → silence_record
+
+    -- RESOLUTION
+    resolved_at         TIMESTAMP
+    resolution_notes    TEXT
+    resolved_by         ENUM            -- DAEMON / USER / TIMEOUT
+}
+
+────────────────────────────────────────────────────
+SCHEMA D — SILENCE RECORD
+Absence as a primary data type.
+────────────────────────────────────────────────────
+
+silence_record {
+
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP       NOT NULL
+
+    -- WHAT IS ABSENT
+    expected_content    TEXT            -- what should exist but doesn't
+    detection_method    TEXT            -- how absence was detected
+    related_query       UUID            FK → query_record
+
+    -- SCOPE OF SILENCE
+    domains_checked     TEXT[]          -- which domains returned nothing
+    sources_checked     INTEGER         -- how many sources consulted
+    time_window         INTERVAL        -- period of checked absence
+
+    -- SILENCE TYPING
+    silence_type        ENUM            -- ORGANIC / COORDINATED / UNKNOWN
+    type_confidence     FLOAT           -- 0.0 to 1.0
+    type_reasoning      TEXT
+
+    -- FINGERPRINT
+    boundary_clarity    FLOAT           -- 0.0 (ragged) to 1.0 (clean)
+                                        -- clean boundary = coordination signal
+    political_alignment_coverage FLOAT -- 0.0 to 1.0
+                                        -- 1.0 = universal across all alignments
+    displacement_event  UUID            FK → information_record
+                                        -- loud story that broke simultaneously
+    displacement_confirmed BOOLEAN
+
+    -- PERSISTENCE
+    investigation_rounds INTEGER        -- recursive passes completed
+    still_silent        BOOLEAN         -- silence persists under investigation
+    escalated           BOOLEAN
+    escalated_at        TIMESTAMP
+
+    -- SIGNIFICANCE
+    significance_score  FLOAT           -- 0.0 to 1.0 — COMPUTED
+    significance_notes  TEXT
+}
+
+────────────────────────────────────────────────────
+SCHEMA E — ENTITY RECORD
+People, organizations, institutions the system tracks.
+────────────────────────────────────────────────────
+
+entity_record {
+
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP
+
+    -- IDENTITY
+    canonical_name      VARCHAR(200)    NOT NULL
+    aliases             TEXT[]
+    entity_type         ENUM            -- PERSON / ORGANIZATION / INSTITUTION /
+                                        -- GOVERNMENT / CORPORATION / OTHER
+
+    -- CONTEXT
+    description         TEXT
+    domains             TEXT[]
+    geo_entities        TEXT[]
+    known_affiliations  UUID[]          FK → entity_record[]
+
+    -- APPEARANCE TRACKING
+    first_seen_at       TIMESTAMP
+    last_seen_at        TIMESTAMP
+    mention_count       INTEGER
+    mention_velocity    FLOAT           -- mentions per day (rolling 30 day)
+    velocity_baseline   FLOAT           -- normal mention rate
+    velocity_anomaly    BOOLEAN         -- current velocity vs baseline
+
+    -- RELATIONSHIP GRAPH
+    -- stored in ChromaDB for semantic proximity
+    -- stored in PostgreSQL for typed edges
+    embedding_id        VARCHAR(100)    FK → ChromaDB vector ID
+}
+
+────────────────────────────────────────────────────
+SCHEMA F — ENTITY RELATIONSHIP
+Typed edges between entities.
+────────────────────────────────────────────────────
+
+entity_relationship {
+
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP
+    last_updated        TIMESTAMP
+
+    entity_a            UUID            FK → entity_record
+    entity_b            UUID            FK → entity_record
+    relationship_type   ENUM            -- CONTROLS / FUNDS / COORDINATES_WITH /
+                                        -- PUBLICLY_OPPOSES / MEMBER_OF /
+                                        -- REPORTS_TO / OWNS / OTHER
+    relationship_notes  TEXT
+
+    -- EVIDENCE
+    confirmed_by        UUID[]          FK → information_record[]
+    confidence          FLOAT
+    data_type           ENUM            -- mirrors information_record type
+
+    -- TEMPORAL
+    relationship_start  TIMESTAMP
+    relationship_end    TIMESTAMP       -- null if ongoing
+    active              BOOLEAN
+}
+
+────────────────────────────────────────────────────
+SCHEMA G — CHECKPOINT RECORD
+System state preservation.
+────────────────────────────────────────────────────
+
+checkpoint_record {
+
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP       NOT NULL
+    trigger             ENUM            -- USER_REQUEST / DATA_WRITE /
+                                        -- ALERT_THRESHOLD / INTERVAL
+
+    -- STATE SNAPSHOT
+    open_queries        UUID[]          FK → query_record[]
+    daemon_state        JSONB           -- current poll states, intervals,
+                                        -- circuit breaker states
+    memory_sync_marker  TIMESTAMP       -- last confirmed DB write before checkpoint
+    ollama_pool_state   JSONB           -- endpoint health at checkpoint time
+
+    -- INTEGRITY
+    checksum            VARCHAR(64)     -- SHA256 of checkpoint payload
+    valid               BOOLEAN         -- false if corrupted
+}
+
+────────────────────────────────────────────────────
+SCHEMA H — MONITORING GAP RECORD
+Downtime logged as data.
+────────────────────────────────────────────────────
+
+monitoring_gap_record {
+
+    id                  UUID            PRIMARY KEY
+    gap_start           TIMESTAMP       NOT NULL    -- last checkpoint before gap
+    gap_end             TIMESTAMP       NOT NULL    -- restart time
+    gap_duration        INTERVAL        COMPUTED
+
+    cause               ENUM            -- CRASH / SHUTDOWN / UNKNOWN
+    last_checkpoint_id  UUID            FK → checkpoint_record
+
+    -- SIGNIFICANCE
+    active_queries_at_gap UUID[]        -- open queries when gap started
+    gap_treated_as_silence BOOLEAN      -- whether gap fed silence detection
+    notes               TEXT
+}
+
+================================================================================
+SECTION 5 — OLLAMA ROUND ROBIN POOL
+================================================================================
+
+Six endpoints. Rotating. Health-checked before each call.
+Failed endpoints go to back of queue. Cooldown before retry.
+
+pool_config {
+    endpoints           TEXT[]          -- six Ollama API URLs
+    current_index       INTEGER         -- round robin pointer
+    health_check_timeout INTEGER        -- ms before marking endpoint unhealthy
+    cooldown_period     INTEGER         -- seconds before retrying failed endpoint
+    retry_attempts      INTEGER         -- per request before falling back
+    fallback            ENUM            -- CLAUDE_API / OPENROUTER / SKIP
+}
+
+ROUTING LOGIC:
+    Monitoring classification      →  Ollama pool (always)
+    Routine research sub-tasks     →  Ollama pool (preferred)
+    Complex reasoning              →  Claude API (preferred) / Ollama fallback
+    Conversation                   →  Claude API (preferred) / Ollama fallback
+    Model consensus (future)       →  two different Ollama endpoints
+                                      Agreement = higher confidence
+                                      Disagreement = flag for human review
+
+MODEL SELECTION: flagged for build phase
+    Decision deferred until hardware benchmarking under load.
+
+================================================================================
+SECTION 6 — ALERT SYSTEM
+================================================================================
+
+Alerts surface immediately. Everything else queues.
+
+alert_record {
+
+    id                  UUID            PRIMARY KEY
+    created_at          TIMESTAMP       NOT NULL
+    fired_at            TIMESTAMP
+
+    -- CONTENT
+    alert_type          ENUM            -- CONVERGENCE / SILENCE_ESCALATION /
+                                        -- ANOMALY / QUERY_ESCALATION /
+                                        -- SOURCE_ANOMALY / ENTITY_SURGE /
+                                        -- DISPLACEMENT_EVENT / OTHER
+    severity            ENUM            -- LOW / MEDIUM / HIGH / CRITICAL
+    summary             TEXT
+    detail              TEXT
+    related_records     UUID[]
+    related_queries     UUID[]
+    related_entities    UUID[]
+
+    -- DELIVERY
+    delivered_via       ENUM            -- TAURI_NOTIFICATION / QUEUE
+    acknowledged        BOOLEAN
+    acknowledged_at     TIMESTAMP
+    dismissed           BOOLEAN
+    notes               TEXT
+}
+
+ESCALATION THRESHOLDS: (values TBD — calibrated during build)
+    Silence persists through N recursive investigation rounds  →  ESCALATE
+    Cross-domain convergence score exceeds threshold           →  ALERT
+    Entity mention velocity exceeds N standard deviations      →  ALERT
+    Universal silence across all political alignments          →  ALERT (HIGH)
+    Displacement event confirmed simultaneous with silence     →  ALERT (HIGH)
+    Monitoring gap exceeds threshold duration                  →  LOG (LOW)
+
+================================================================================
+SECTION 7 — TAURI UI SURFACE
+================================================================================
+
+Rust backend / web frontend.
+Shares codebase with daemon where possible.
+
+VIEWS:
+    Dashboard       — live monitoring state / active alerts / signal overview
+    Memory          — searchable knowledge store / confirmed facts / aged facts
+    Investigations  — open QUERY threads / escalated silences / closed threads
+    Entities        — entity registry / relationship graph visualization
+    Conversation    — plain language interface to the full system
+    Sources         — source registry / trust scores / circuit breaker states
+    Gaps            — monitoring gap log / silence records
+    Checkpoints     — checkpoint history / system state
+
+SYSTEM TRAY:
+    Daemon running indicator
+    Alert badge
+    Quick conversation access
+    Manual checkpoint trigger
+
+================================================================================
+SECTION 8 — OPEN ITEMS (FLAGGED — NOT BLOCKING)
+================================================================================
+
+    1.  Time decay rate — uniform decay calibrated during build
+    2.  Minimum source count for VERIFIED upgrade — likely 3, TBD
+    3.  QUERY depth limit — likely 5-7 recursive levels, TBD
+    4.  Checkpoint interval — likely 15-30 minutes, TBD
+    5.  Model selection across Ollama pool — deferred to build phase
+    6.  Model consensus implementation — deferred to build phase
+    7.  Alert threshold values — calibrated during build
+    8.  Significance score algorithm for silence records — designed during build
+    9.  Coordination detection algorithm — Phase 1 uses statistics (Welford +
+        timing analysis + boundary clarity score). Phase 2 uses behavioral
+        clustering ML. Schema supports both. Phase 2 does not block Phase 1.
+    10. ChromaDB embedding model selection — deferred to build phase
+    11. Celery worker count tuning — start at 4, adjust based on RAM headroom
+    12. Stage 2 embedding refresh schedule — implemented after system stable
+
+================================================================================
+SECTION 9 — ENGINEERING RISKS & MITIGATIONS
+================================================================================
+
+RISK 1 — PYTHON LAYER BOTTLENECK
+    Risk: Research layer doing recursive queries, external calls, LLM reasoning,
+          and memory writes becomes choke point under load.
+    Mitigation:
+        asyncio + aiohttp — nothing blocks, all I/O concurrent
+        Celery + Redis task queue — QUERY threads run as parallel workers
+        Worker ceiling: 4 (RAM-constrained, not CPU-constrained)
+        Escape hatch: Rust daemon absorbs orchestration if Python still bottlenecks
+        Only LLM-dependent tasks remain in Python at that point
+    Status: MITIGATED — architecture designed around this from start
+
+RISK 2 — CHROMADB / POSTGRES SYNC DRIFT
+    Risk: Fact decays in Postgres but embedding still ranks highly in Chroma.
+          Semantically relevant but epistemically weak retrieval corrupts output.
+    Mitigation:
+        Stage 1: Confidence-weighted retrieval at query time (immediate)
+            final_score = semantic_similarity * confidence_value * (1 - decay_factor)
+        Stage 2: Scheduled embedding refresh with metadata filtering (post-stable)
+    Status: MITIGATED — two-stage solution defined
+
+RISK 3 — COORDINATION DETECTION ACCURACY
+    Risk: "Coordinated silence" becomes pattern projection instead of detection.
+          System sees coordination where there is none.
+    Mitigation:
+        Phase 1 — statistics only, no ML:
+            Timing analysis from ingestion timestamps (already computable)
+            Welford z-score on story-type absence vs baseline
+            Boundary clarity score (ragged vs clean silence boundary)
+            Political alignment coverage score (0.0 to 1.0)
+        Phase 2 — behavioral clustering ML (future, does not block Phase 1)
+        All coordination findings labeled CONTESTED until cross-domain confirmed
+        System never asserts coordination — it reports the measurable fingerprint
+        and labels it. Human concludes.
+    Status: PARTIALLY MITIGATED — Phase 1 defined, Phase 2 flagged
+
+RISK 4 — RECURSIVE QUERY EXPLOSION
+    Risk: Sub-queries and recursive depth produce exponential thread growth.
+          System drowns in its own investigations.
+    Mitigation:
+        Hard depth limit: 5-7 levels, enforced at spawn
+        Priority weighting: significance score gates worker slot access
+        Kill conditions (all three enforced):
+            No new information after N attempts → terminate branch
+            Duplicate question detected → merge to existing thread
+            System thread limit exceeded → queue, do not spawn
+        Deduplication check before every spawn — most critical control
+        Manual kill available from Tauri UI at any time
+    Status: MITIGATED — three controls defined and required
+
+RISK 5 — HARDWARE CEILING
+    Risk: i7-8700 / 20GB RAM hits memory and latency ceiling under full load.
+    Mitigation:
+        RAM allocation documented and budgeted (see Section 2, Layer 2)
+        Conservative total: 12-18GB — 2-8GB headroom
+        One Ollama model at a time — six remote APIs, not six local processes
+        Celery workers capped at 4
+        ChromaDB memory-mapped — does not load full index into RAM
+        PgBouncer connection pooling on Postgres
+        First thing to move off-box if ceiling hit: ChromaDB → cheap VPS
+        Everything else stays local
+    Status: MITIGATED — within hardware limits with discipline
+
+================================================================================
+
+████████████████████████████████████████████████████████████
+TAURUS INDUSTRIES
+Truth. Full Spectrum. No Allegiance.
+████████████████████████████████████████████████████████████
+END OF VOLUME IV — SCHEMA & TECHNICAL ARCHITECTURE
+████████████████████████████████████████████████████████████
