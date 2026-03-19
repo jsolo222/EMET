@@ -1,0 +1,1 @@
+"""Recursive QUERY investigation loop."""

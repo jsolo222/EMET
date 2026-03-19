@@ -1,0 +1,1 @@
+/// Checkpoint system — state preservation.

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"
+
+[project]
+name = "emet-brain"
+version = "0.1.0"
+description = "EMET research and conversation layer — Layer 3"
+requires-python = ">=3.11"
+dependencies = [
+    "celery[redis]",
+    "aiohttp",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "chromadb",
+    "anthropic",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]

@@ -1,0 +1,32 @@
+# EMET Daemon Configuration
+
+[daemon]
+checkpoint_interval_minutes = 15
+log_level = "info"
+
+[database]
+postgres_url = "postgresql://emet:emet@localhost:6432/emet"  # via PgBouncer
+chromadb_url = "http://localhost:8000"
+
+[ollama]
+endpoints = [
+    "http://ollama1:11434",
+    "http://ollama2:11434",
+    "http://ollama3:11434",
+    "http://ollama4:11434",
+    "http://ollama5:11434",
+    "http://ollama6:11434",
+]
+health_check_timeout_ms = 5000
+cooldown_seconds = 30
+retry_attempts = 2
+fallback = "claude_api"
+
+[anomaly]
+welford_min_samples = 100
+z_score_threshold = 2.0
+
+[gcp]
+poll_interval_seconds = 60
+baseline_window_days = 30
+alert_z_threshold = 2.0
