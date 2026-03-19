@@ -1,0 +1,16 @@
+# EMET Alert Thresholds
+# Values TBD — calibrated during build phase
+
+[thresholds]
+silence_investigation_rounds = 5
+convergence_score = 0.75
+entity_velocity_z_score = 3.0
+universal_silence_coverage = 0.9
+monitoring_gap_minutes = 60
+
+[severity_mapping]
+silence_escalation = "HIGH"
+convergence_alert = "MEDIUM"
+entity_surge = "MEDIUM"
+displacement_event = "HIGH"
+gcp_silence_correlation = "HIGH"

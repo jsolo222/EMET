@@ -1,0 +1,71 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+*.whl
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Node / Tauri
+node_modules/
+dist/
+.nuxt/
+.output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+dump.rdb
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Coverage / Testing
+htmlcov/
+.coverage
+.pytest_cache/
+.tox/
+
+# ChromaDB local data
+chroma_data/
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/icons/icon.ico

@@ -1,0 +1,27 @@
+# EMET Brain Configuration
+
+[brain]
+log_level = "info"
+
+[celery]
+broker_url = "redis://localhost:6379/0"
+result_backend = "redis://localhost:6379/1"
+worker_count = 4
+task_time_limit = 300
+
+[research]
+max_query_depth = 5
+max_open_threads = 50
+dedup_similarity_threshold = 0.85
+no_new_info_kill_after = 3
+
+[conversation]
+default_model = "claude"
+
+[llm.claude]
+api_key = ""
+model = "claude-sonnet-4-20250514"
+fallback_via_openrouter = true
+
+[llm.ollama]
+# Uses daemon's ollama pool endpoints
